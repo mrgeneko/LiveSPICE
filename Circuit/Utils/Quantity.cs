@@ -122,7 +122,8 @@ namespace Circuit
         {
             switch (Prefix)
             {
-                case "u": return "\u03BC";
+                case "u": return "\u03BC";        // ASCII 'u'
+                case "\u00B5": return "\u03BC";   // U+00B5 MICRO SIGN (what most tools/.schx emit) -> GREEK MU
                 default: return Prefix;
             }
         }
