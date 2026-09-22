@@ -47,6 +47,26 @@ namespace Circuit.Components
         [Serialize, Category("Koren")]
         public Quantity Vg { get { return vg; } set { if (vg.Set(value)) NotifyChanged(nameof(Vg)); } }
 
+        // EMITTER FORK: interelectrode capacitance, ported from Triode's SimulateCapacitances.
+        // Only control-grid/plate/cathode caps are modeled (no screen-grid terms) -- matches
+        // what fitted datasheet data is normally available for beam-power/pentode output tubes.
+        // Opt-in, defaults false: existing circuits are unaffected until they set this true.
+        private bool simulateCapacitances;
+        [Serialize, Category("Koren")]
+        public bool SimulateCapacitances { get { return simulateCapacitances; } set { simulateCapacitances = value; NotifyChanged(nameof(SimulateCapacitances)); } }
+
+        private Quantity _cgp = new Quantity(2.4e-12m, Units.F);
+        [Serialize, Description("Grid to plate capacitance.")]
+        public Quantity Cgp { get { return _cgp; } set { _cgp = value; NotifyChanged(nameof(Cgp)); } }
+
+        private Quantity _cgk = new Quantity(2.3e-12m, Units.F);
+        [Serialize, Description("Grid to cathode capacitance.")]
+        public Quantity Cgk { get { return _cgk; } set { _cgk = value; NotifyChanged(nameof(Cgk)); } }
+
+        private Quantity _cpk = new Quantity(9e-13m, Units.F);
+        [Serialize, Description("Plate to cathode capacitance.")]
+        public Quantity Cpk { get { return _cpk; } set { _cpk = value; NotifyChanged(nameof(Cpk)); } }
+
         public Pentode()
         {
             _plate = new Terminal(this, "P");
@@ -115,6 +135,13 @@ namespace Circuit.Components
             var ig = Call.If(vgk < vg - knee, 0, Call.If(vgk > vg + knee, (vgk - vg) / rg1, a * vgk * vgk + b * vgk + c));
             var ig2 = iKoren / Kg2;
             var ik = -(ip + ig + ig2);
+
+            if (SimulateCapacitances)
+            {
+                Capacitor.Analyze(Mna, Name + "_cgp", _plate, _grid, _cgp);
+                Capacitor.Analyze(Mna, Name + "_cgk", _grid, _cathode, _cgk);
+                Capacitor.Analyze(Mna, Name + "_cpk", _plate, _cathode, _cpk);
+            }
 
             Mna.AddTerminal(_plate, ip);
             Mna.AddTerminal(_grid, ig);
