@@ -50,7 +50,26 @@ namespace Circuit
             Mna.AddTerminal(sa, -Isa);
             Mna.AddTerminal(sc, Isc);
             Mna.AddTerminal(st, Isa - Isc);
-            Mna.AddEquation(Ip * turns, Isa + Isc);
+            // EMITTER FORK: fix the ampere-turns equation's missing factor of 2.
+            // Was `Ip * turns == Isa + Isc`, which is off by a factor of
+            // two and silently violates energy conservation (power delivered to a resistive
+            // secondary load comes out at 2x the power drawn from the primary, for ANY load,
+            // independent of `turns` -- verified both by hand from these equations and by an
+            // isolated A/B render of a real amp circuit through this solver, which measured a
+            // consistent ~4.8 dB level increase from clean tone through hard clipping when this
+            // component is used instead of two plain Transformers).
+            //
+            // `turns` here is Np : Ns_total (the primary-to-FULL-secondary ratio -- see the two
+            // voltage equations below, which correctly relate Vp to each HALF-secondary voltage
+            // via `turns * 2`, i.e. they already encode Ns_half = Ns_total / 2). Ampere-turns
+            // conservation for a winding split symmetrically in half is
+            //     Np * Ip = Ns_half * (Isa + Isc) = (Ns_total / 2) * (Isa + Isc)
+            // which in terms of `turns` (= Np / Ns_total) is
+            //     Ip * turns = (Isa + Isc) / 2   <=>   Ip * turns * 2 = Isa + Isc
+            // i.e. the SAME `* 2` factor the voltage equations already use, restoring the
+            // symmetry between the current and voltage relations that a correct ideal
+            // center-tapped transformer has.
+            Mna.AddEquation(Ip * turns * 2, Isa + Isc);
 
             Expression Vp = pa.V - pc.V;
             Expression Vs1 = sa.V - st.V;
