@@ -5,11 +5,36 @@ using System.ComponentModel;
 
 namespace Circuit.Components
 {
+    /// <summary>
+    /// Which equation computes the pentode's plate and screen current. Both share the same parameters
+    /// (Mu, Ex, Kg1, Kg2, Kp, Kvb) but a parameter set is only valid for the equation it was fitted with.
+    /// </summary>
+    public enum PentodeModel
+    {
+        /// <summary>
+        /// The original equation: E1 = Vpk/Kp * ln(1+exp(Kp*(1/Mu + Vgk/sqrt(Kvb + Vg2k^2)))), i.e. scaled by the
+        /// PLATE voltage, so plate current rises ~Vpk^Ex with no saturation above the knee. The default, so every
+        /// existing schematic renders exactly as before.
+        /// </summary>
+        PlateScaled,
+
+        /// <summary>
+        /// Koren's published tetrode form: E1 = Vg2k/Kp * ln(1+exp(Kp*(1/Mu + Vgk/Vg2k))), scaled by the SCREEN
+        /// voltage. Fits datasheet currents at Vp ~ Vs and at Vs below Vp, and gives realistic plate current at low
+        /// plate voltage. Vg2k is floored at 1 V so the expression stays defined with the screen at or below the cathode.
+        /// </summary>
+        Koren,
+    }
+
     [Category("Vacuum Tubes")]
     [DisplayName("Pentode")]
     public class Pentode : Component
     {
         private Terminal _plate, _grid, _grid2, _cathode;
+
+        private PentodeModel _model = PentodeModel.PlateScaled;
+        [Serialize, Description("Equation used for plate and screen current. A parameter set is only valid for the model it was fitted with.")]
+        public PentodeModel Model { get { return _model; } set { _model = value; NotifyChanged(nameof(Model)); } }
 
         private double _mu = 10.7;
         [Serialize, Category("Koren"), Description("Voltage gain.")]
@@ -120,7 +145,17 @@ namespace Circuit.Components
             var vgk = _grid.V - _cathode.V;
             var vg2k = _grid2.V - _cathode.V;
 
-            var E1 = vpk / Kp * Ln1Exp(Kp * ((1.0 / Mu) + (vgk * Binary.Power(Kvb + vg2k * vg2k, -.5))));
+            Expression E1;
+            switch (_model)
+            {
+                case PentodeModel.Koren:
+                    var vs = Call.If(vg2k > 1.0, vg2k, 1.0);
+                    E1 = vs / Kp * Ln1Exp(Kp * ((1.0 / Mu) + (vgk / vs)));
+                    break;
+                default:    // PentodeModel.PlateScaled: the original equation, unchanged
+                    E1 = vpk / Kp * Ln1Exp(Kp * ((1.0 / Mu) + (vgk * Binary.Power(Kvb + vg2k * vg2k, -.5))));
+                    break;
+            }
             var iKoren = Call.If(E1 > 0, Binary.Power(E1, Ex), 0);
             var ip = Call.If(vpk > 0, iKoren / Kg1 * Call.ArcTan(vpk / Kvb), 0);
 
