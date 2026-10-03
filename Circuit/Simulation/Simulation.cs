@@ -21,7 +21,7 @@ namespace Circuit
     /// </summary>
     public class NewtonStats
     {
-        public long Solves, Exhausted, FirstExhausted = -1, LastExhausted = -1, SamplesProcessed;
+        public long Solves, Exhausted, Severe, FirstExhausted = -1, LastExhausted = -1, SamplesProcessed;
         public double MaxAbsOutput;
         public string[] UnknownNames;
         public int TraceLimit;
@@ -31,13 +31,13 @@ namespace Circuit
 
         public void Reset()
         {
-            Solves = Exhausted = SamplesProcessed = 0; FirstExhausted = LastExhausted = -1; MaxAbsOutput = 0;
+            Solves = Exhausted = Severe = SamplesProcessed = 0; FirstExhausted = LastExhausted = -1; MaxAbsOutput = 0;
             Traces.Clear(); tn = 0;
         }
 
-        public void Add(long solves, long exhausted, long first, long last, double maxAbs, int samples)
+        public void Add(long solves, long exhausted, long severe, long first, long last, double maxAbs, int samples)
         {
-            Solves += solves; Exhausted += exhausted;
+            Solves += solves; Exhausted += exhausted; Severe += severe;
             if (first >= 0 && FirstExhausted < 0) FirstExhausted = first;
             if (last >= 0) LastExhausted = last;
             if (maxAbs > MaxAbsOutput) MaxAbsOutput = maxAbs;
@@ -66,8 +66,8 @@ namespace Circuit
         public string Summary()
         {
             return string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                "newton: solves={0} unconverged={1} ({2:F4}%) first_sample={3} last_sample={4} max_abs_output={5:G4}",
-                Solves, Exhausted, 100.0 * Exhausted / Math.Max(Solves, 1), FirstExhausted, LastExhausted, MaxAbsOutput);
+                "newton: solves={0} unconverged={1} ({2:F4}%) severe={6} first_sample={3} last_sample={4} max_abs_output={5:G4}",
+                Solves, Exhausted, 100.0 * Exhausted / Math.Max(Solves, 1), FirstExhausted, LastExhausted, MaxAbsOutput, Severe);
         }
 
         public IEnumerable<string> TraceLines()
@@ -165,6 +165,24 @@ namespace Circuit
         private int traceNewton = 0;
         /// <summary>Keep the per-iteration trajectories of the first N unconverged solves (0 = off; slows the solve).</summary>
         public int TraceNewton { get { return traceNewton; } set { traceNewton = value; InvalidateProcess(); } }
+
+        private int lineSearchAfter = 20;
+        /// <summary>Backtracking only engages after this many plain Newton iterations, so solves that converge quickly are untouched.</summary>
+        public int LineSearchAfter { get { return lineSearchAfter; } set { lineSearchAfter = value; InvalidateProcess(); } }
+
+        private int lineSearch = 0;
+        /// <summary>
+        /// Default off. If &gt; 0: residual-monitored backtracking for solves that are not converging. After each Newton
+        /// update the next iteration's assembly yields ||F|| at the new point for free; once LineSearchAfter plain
+        /// iterations have passed, a step after which the squared residual norm grew by more than LineSearchSlack
+        /// (relative) is undone and a halved step taken instead, up to this many halvings per step. Solves that
+        /// converge within LineSearchAfter iterations are unaffected (bit-identical).
+        /// </summary>
+        public int LineSearch { get { return lineSearch; } set { lineSearch = value; InvalidateProcess(); } }
+
+        private double lineSearchSlack = 0.1;
+        /// <summary>Relative growth of the squared residual norm tolerated before a step is backtracked.</summary>
+        public double LineSearchSlack { get { return lineSearchSlack; } set { lineSearchSlack = value; InvalidateProcess(); } }
 
         private double trustRegion = 0.0;
         /// <summary>
@@ -356,11 +374,12 @@ namespace Circuit
             ParamExpr nwBase = code.DeclInit<long>("nwBase", LinqExpr.Field(statsConst, nameof(NewtonStats.SamplesProcessed)));
             ParamExpr nwSolves = code.DeclInit<long>("nwSolves", 0L);
             ParamExpr nwExh = code.DeclInit<long>("nwExh", 0L);
+            ParamExpr nwSevere = code.DeclInit<long>("nwSevere", 0L);
             ParamExpr nwFirst = code.DeclInit<long>("nwFirst", -1L);
             ParamExpr nwLast = code.DeclInit<long>("nwLast", -1L);
             ParamExpr nwMax = code.DeclInit<double>("nwMax", 0.0);
             Func<LinqExpr> flushStats = () => LinqExpr.Call(statsConst, typeof(NewtonStats).GetMethod(nameof(NewtonStats.Add)),
-                nwSolves, nwExh, nwFirst, nwLast, nwMax, SampleCount);
+                nwSolves, nwExh, nwSevere, nwFirst, nwLast, nwMax, SampleCount);
 
             // for (int n = 0; n < SampleCount; ++n)
             ParamExpr n = code.Decl<int>("n");
@@ -427,11 +446,33 @@ namespace Circuit
 
                                 // int it = iterations
                                 LinqExpr it = code.ReDeclInit<int>("it", Iterations);
+                                // Largest Newton step of the most recent iteration, to tell a failed solve from harmless chatter.
+                                LinqExpr nwLastStep = code.ReDeclInit<double>("nwlaststep", 0.0);
+                                // EXPERIMENTAL residual-monitored backtracking: state that persists across iterations.
+                                LinqExpr lsFnow = null, lsFprev = null, lsAlpha = null, lsBack = null;
+                                var lsVo = new Dictionary<Expression, LinqExpr>();
+                                var lsDp = new Dictionary<Expression, LinqExpr>();
+                                System.Linq.Expressions.LabelTarget lsSkip = null;
+                                if (LineSearch > 0)
+                                {
+                                    lsFnow = code.ReDeclInit<double>("lsfnow", 0.0);
+                                    lsFprev = code.ReDeclInit<double>("lsfprev", 1e300);
+                                    lsAlpha = code.ReDeclInit<double>("lsalpha", 1.0);
+                                    lsBack = code.ReDeclInit<int>("lsback", 0);
+                                    int lk = 0;
+                                    foreach (Expression u in S.Unknowns)
+                                    {
+                                        lsVo[u] = code.ReDeclInit<double>("lsvo" + lk, 0.0);
+                                        lsDp[u] = code.ReDeclInit<double>("lsdp" + lk, 0.0);
+                                        lk++;
+                                    }
+                                    lsSkip = LinqExpr.Label("ls_skip");
+                                }
                                 // do { ... --it } while(it > 0)
                                 code.DoWhile((Break) =>
                                 {
                                     // Solve the un-solved system.
-                                    Solve(code, JxF, S.Equations, S.UnknownDeltas);
+                                    Solve(code, JxF, S.Equations, S.UnknownDeltas, lsFnow);
 
                                     // Optional trust region: scale the whole step if its norm exceeds TrustRegion volts.
                                     if (TrustRegion > 0)
@@ -451,6 +492,46 @@ namespace Circuit
                                     if (S.KnownDeltas != null)
                                         foreach (Arrow i in S.KnownDeltas)
                                             code.DeclInit(i.Left, i.Right);
+
+                                    // EXPERIMENTAL residual-monitored backtracking.
+                                    if (LineSearch > 0)
+                                    {
+                                        // Is the Newton step at this point already below the step tolerance? Then never backtrack.
+                                        LinqExpr lsConv = code.ReDeclInit("lsconv", true);
+                                        foreach (Expression u in S.Unknowns)
+                                            code.Add(LinqExpr.AndAssign(lsConv, LinqExpr.LessThan(Abs(code[NewtonIteration.Delta(u)]),
+                                                MultiplyAdd(Abs(code[u]), LinqExpr.Constant(1e-4), LinqExpr.Constant(1e-6)))));
+                                        // Bad: we have a base point, the residual at THIS point grew clearly, and halvings remain.
+                                        LinqExpr lsBad = LinqExpr.AndAlso(
+                                            LinqExpr.AndAlso(LinqExpr.AndAlso(LinqExpr.LessThan(lsFprev, LinqExpr.Constant(1e299)), LinqExpr.Not(lsConv)),
+                                                LinqExpr.GreaterThanOrEqual(LinqExpr.Subtract(LinqExpr.Constant(Iterations), it), LinqExpr.Constant(LineSearchAfter))),
+                                            LinqExpr.AndAlso(LinqExpr.LessThan(lsBack, LinqExpr.Constant(LineSearch)),
+                                                LinqExpr.GreaterThan(lsFnow, LinqExpr.Multiply(LinqExpr.Constant(1.0 + LineSearchSlack), lsFprev))));
+                                        var lsRevert = new List<LinqExpr>();
+                                        lsRevert.Add(LinqExpr.PreIncrementAssign(lsBack));
+                                        lsRevert.Add(LinqExpr.Assign(lsAlpha, LinqExpr.Multiply(lsAlpha, LinqExpr.Constant(0.5))));
+                                        foreach (Expression u in S.Unknowns)
+                                            lsRevert.Add(LinqExpr.Assign(code[u], LinqExpr.Add(lsVo[u], LinqExpr.Multiply(lsAlpha, lsDp[u]))));
+                                        lsRevert.Add(LinqExpr.Goto(lsSkip));
+                                        code.Add(LinqExpr.IfThen(lsBad, LinqExpr.Block(lsRevert)));
+                                        // Accepted: this point becomes the new base, and its full step is remembered.
+                                        foreach (Expression u in S.Unknowns)
+                                        {
+                                            code.Add(LinqExpr.Assign(lsVo[u], code[u]));
+                                            code.Add(LinqExpr.Assign(lsDp[u], code[NewtonIteration.Delta(u)]));
+                                        }
+                                        code.Add(LinqExpr.Assign(lsAlpha, LinqExpr.Constant(1.0)));
+                                        code.Add(LinqExpr.Assign(lsBack, LinqExpr.Constant(0)));
+                                        code.Add(LinqExpr.Assign(lsFprev, lsFnow));
+                                    }
+
+                                    // Remember the size of this iteration's step (cheap: one compare per unknown).
+                                    code.Add(LinqExpr.Assign(nwLastStep, LinqExpr.Constant(0.0)));
+                                    foreach (Expression u in S.Unknowns)
+                                    {
+                                        LinqExpr nwa = Abs(code[NewtonIteration.Delta(u)]);
+                                        code.Add(LinqExpr.IfThen(LinqExpr.GreaterThan(nwa, nwLastStep), LinqExpr.Assign(nwLastStep, nwa)));
+                                    }
 
                                     // Opt-in per-iteration trace: largest step, largest unknown, and the dominant unknown.
                                     if (TraceNewton > 0)
@@ -493,6 +574,9 @@ namespace Circuit
                                     // if (done) break
                                     code.Add(LinqExpr.IfThen(done, Break));
 
+                                    // A backtracked iteration jumps here: it counts against the cap but applies no update.
+                                    if (LineSearch > 0)
+                                        code.Add(LinqExpr.Label(lsSkip));
                                     // --it;
                                     code.Add(LinqExpr.PreDecrementAssign(it));
                                 }, LinqExpr.GreaterThan(it, Zero));
@@ -502,6 +586,8 @@ namespace Circuit
                                 code.Add(LinqExpr.PreIncrementAssign(nwSolves));
                                 code.Add(LinqExpr.IfThen(LinqExpr.Equal(it, Zero), LinqExpr.Block(
                                     LinqExpr.PreIncrementAssign(nwExh),
+                                    // Severe: the cap ran out while the step was still larger than 1 (V or A), not just chattering at a rounding floor.
+                                    LinqExpr.IfThen(LinqExpr.GreaterThan(nwLastStep, LinqExpr.Constant(1.0)), LinqExpr.PreIncrementAssign(nwSevere)),
                                     LinqExpr.IfThen(LinqExpr.LessThan(nwFirst, LinqExpr.Constant(0L)), LinqExpr.Assign(nwFirst, nwPos)),
                                     LinqExpr.Assign(nwLast, nwPos))));
                                 if (TraceNewton > 0)
@@ -587,7 +673,7 @@ namespace Circuit
         }
 
         // Solve a system of linear equations
-        private static void Solve(CodeGen code, LinqExpr Ab, IEnumerable<LinearCombination> Equations, IEnumerable<Expression> Unknowns)
+        private static void Solve(CodeGen code, LinqExpr Ab, IEnumerable<LinearCombination> Equations, IEnumerable<Expression> Unknowns, LinqExpr fOut = null)
         {
             LinearCombination[] eqs = Equations.ToArray();
             Expression[] deltas = Unknowns.ToArray();
@@ -615,6 +701,18 @@ namespace Circuit
                 code.Add(LinqExpr.Assign(
                     LinqExpr.ArrayAccess(Abi, LinqExpr.Constant(N)), 
                     LinqExpr.Constant(0.0)));
+            }
+
+            // Optional: the squared residual norm at the current point is the right-hand-side column BEFORE elimination.
+            if (fOut != null)
+            {
+                LinqExpr fs = LinqExpr.Constant(0.0);
+                for (int i = 0; i < M; ++i)
+                {
+                    LinqExpr fi = LinqExpr.ArrayAccess(LinqExpr.ArrayAccess(Ab, LinqExpr.Constant(i)), LinqExpr.Constant(N));
+                    fs = LinqExpr.Add(fs, LinqExpr.Multiply(fi, fi));
+                }
+                code.Add(LinqExpr.Assign(fOut, fs));
             }
 
             // Fully solve this system of equations.
