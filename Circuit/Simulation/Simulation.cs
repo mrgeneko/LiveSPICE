@@ -14,6 +14,83 @@ namespace Circuit
     /// <summary>
     /// Exception thrown when a simulation does not converge.
     /// </summary>
+    /// <summary>
+    /// Newton-solver diagnostics for a Simulation. The counters are always on (inline locals in the generated
+    /// code, flushed once per Run chunk and on divergence); the per-iteration trace is opt-in (TraceNewton).
+    /// A solve is "unconverged" when its iteration cap ran out before the step test passed.
+    /// </summary>
+    public class NewtonStats
+    {
+        public long Solves, Exhausted, FirstExhausted = -1, LastExhausted = -1, SamplesProcessed;
+        public double MaxAbsOutput;
+        public string[] UnknownNames;
+        public int TraceLimit;
+        public List<Tuple<long, double[]>> Traces = new List<Tuple<long, double[]>>();
+        private readonly double[] tbuf = new double[6 * 16384];
+        private int tn;
+
+        public void Reset()
+        {
+            Solves = Exhausted = SamplesProcessed = 0; FirstExhausted = LastExhausted = -1; MaxAbsOutput = 0;
+            Traces.Clear(); tn = 0;
+        }
+
+        public void Add(long solves, long exhausted, long first, long last, double maxAbs, int samples)
+        {
+            Solves += solves; Exhausted += exhausted;
+            if (first >= 0 && FirstExhausted < 0) FirstExhausted = first;
+            if (last >= 0) LastExhausted = last;
+            if (maxAbs > MaxAbsOutput) MaxAbsOutput = maxAbs;
+            SamplesProcessed += samples;
+        }
+
+        public void TraceIter(int iteration, double maxDv, double maxV, int dominant, double dvDominant, double vDominant)
+        {
+            if (tn >= 16384) return;
+            int o = tn * 6;
+            tbuf[o] = iteration; tbuf[o + 1] = maxDv; tbuf[o + 2] = maxV; tbuf[o + 3] = dominant; tbuf[o + 4] = dvDominant; tbuf[o + 5] = vDominant;
+            ++tn;
+        }
+
+        public void EndSolve(long sample, int exhausted)
+        {
+            if (exhausted != 0 && Traces.Count < TraceLimit)
+            {
+                var copy = new double[tn * 6];
+                Array.Copy(tbuf, copy, tn * 6);
+                Traces.Add(Tuple.Create(sample, copy));
+            }
+            tn = 0;
+        }
+
+        public string Summary()
+        {
+            return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "newton: solves={0} unconverged={1} ({2:F4}%) first_sample={3} last_sample={4} max_abs_output={5:G4}",
+                Solves, Exhausted, 100.0 * Exhausted / Math.Max(Solves, 1), FirstExhausted, LastExhausted, MaxAbsOutput);
+        }
+
+        public IEnumerable<string> TraceLines()
+        {
+            foreach (var tr in Traces)
+            {
+                double[] a = tr.Item2; int cnt = a.Length / 6; int flips = 0;
+                for (int q = 1; q < cnt; q++)
+                    if (Math.Sign(a[q * 6 + 4]) != Math.Sign(a[(q - 1) * 6 + 4])) flips++;
+                yield return "newton-trace: solve at sample " + tr.Item1 + ", iterations=" + cnt + ", dominant-step sign flips=" + flips + "/" + Math.Max(cnt - 1, 0);
+                for (int q = 0; q < cnt; q++)
+                {
+                    if (!(q < 12 || q % 256 == 0 || q >= cnt - 6)) continue;
+                    int ai = (int)a[q * 6 + 3];
+                    string name = (UnknownNames != null && ai >= 0 && ai < UnknownNames.Length) ? UnknownNames[ai] : "?";
+                    yield return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "newton-trace:   it={0} max|dv|={1:E3} max|v|={2:E3} dominant={3} dv={4:E3} v={5:E3}",
+                        (int)a[q * 6], a[q * 6 + 1], a[q * 6 + 2], name, a[q * 6 + 4], a[q * 6 + 5]);
+                }
+            }
+        }
+    }
+
     public class SimulationDiverged : FailedToConvergeException
     {
         private long at;
@@ -74,6 +151,27 @@ namespace Circuit
         /// Oversampling factor for this simulation.
         /// </summary>
         public int Oversample { get { return oversample; } set { oversample = value; InvalidateProcess(); } }
+
+        /// <summary>Newton-solver diagnostics (unconverged-solve counts, output magnitude, optional trace).</summary>
+        public NewtonStats Stats { get; } = new NewtonStats();
+
+        private double magnitudeLimit = 1e6;
+        /// <summary>
+        /// A finite output magnitude (volts) beyond which the render is treated as diverged. The existing check only
+        /// catches NaN/infinity, so a numerical blow-up to e.g. 5e37 V passed silently. 0 disables the check.
+        /// </summary>
+        public double MagnitudeLimit { get { return magnitudeLimit; } set { magnitudeLimit = value; InvalidateProcess(); } }
+
+        private int traceNewton = 0;
+        /// <summary>Keep the per-iteration trajectories of the first N unconverged solves (0 = off; slows the solve).</summary>
+        public int TraceNewton { get { return traceNewton; } set { traceNewton = value; InvalidateProcess(); } }
+
+        private double trustRegion = 0.0;
+        /// <summary>
+        /// EXPERIMENTAL, default off. If &gt; 0, scale the whole Newton step vector when its norm exceeds this many
+        /// volts (direction-preserving, as in hotspice). The right radius depends on the circuit's voltage scale.
+        /// </summary>
+        public double TrustRegion { get { return trustRegion; } set { trustRegion = value; InvalidateProcess(); } }
 
         private int iterations = 8;
         /// <summary>
@@ -253,6 +351,17 @@ namespace Circuit
             for (int j = 0; j < M; ++j)
                 code.Add(LinqExpr.Assign(LinqExpr.ArrayAccess(JxF, LinqExpr.Constant(j)), LinqExpr.NewArrayBounds(typeof(double), Vector.IsHardwareAccelerated ? LinqExpr.Constant(N + Vector<double>.Count - 1) : LinqExpr.Constant(N))));
 
+            // Newton diagnostics: always-on counters kept in locals, flushed to Stats once per chunk and on divergence.
+            LinqExpr statsConst = LinqExpr.Constant(Stats);
+            ParamExpr nwBase = code.DeclInit<long>("nwBase", LinqExpr.Field(statsConst, nameof(NewtonStats.SamplesProcessed)));
+            ParamExpr nwSolves = code.DeclInit<long>("nwSolves", 0L);
+            ParamExpr nwExh = code.DeclInit<long>("nwExh", 0L);
+            ParamExpr nwFirst = code.DeclInit<long>("nwFirst", -1L);
+            ParamExpr nwLast = code.DeclInit<long>("nwLast", -1L);
+            ParamExpr nwMax = code.DeclInit<double>("nwMax", 0.0);
+            Func<LinqExpr> flushStats = () => LinqExpr.Call(statsConst, typeof(NewtonStats).GetMethod(nameof(NewtonStats.Add)),
+                nwSolves, nwExh, nwFirst, nwLast, nwMax, SampleCount);
+
             // for (int n = 0; n < SampleCount; ++n)
             ParamExpr n = code.Decl<int>("n");
             code.For(
@@ -324,10 +433,50 @@ namespace Circuit
                                     // Solve the un-solved system.
                                     Solve(code, JxF, S.Equations, S.UnknownDeltas);
 
+                                    // Optional trust region: scale the whole step if its norm exceeds TrustRegion volts.
+                                    if (TrustRegion > 0)
+                                    {
+                                        LinqExpr trsn = code.ReDeclInit<double>("trsn", 0.0);
+                                        foreach (Expression d in S.UnknownDeltas)
+                                            code.Add(LinqExpr.AddAssign(trsn, LinqExpr.Multiply(code[d], code[d])));
+                                        LinqExpr trsc = code.ReDeclInit<double>("trsc", 1.0);
+                                        code.Add(LinqExpr.IfThen(LinqExpr.GreaterThan(trsn, LinqExpr.Constant(TrustRegion * TrustRegion)),
+                                            LinqExpr.Assign(trsc, LinqExpr.Divide(LinqExpr.Constant(TrustRegion),
+                                                LinqExpr.Call(typeof(Math).GetMethod("Sqrt", new Type[] { typeof(double) }), trsn)))));
+                                        foreach (Expression d in S.UnknownDeltas)
+                                            code.Add(LinqExpr.MultiplyAssign(code[d], trsc));
+                                    }
+
                                     // Compile the pre-solved solutions.
                                     if (S.KnownDeltas != null)
                                         foreach (Arrow i in S.KnownDeltas)
                                             code.DeclInit(i.Left, i.Right);
+
+                                    // Opt-in per-iteration trace: largest step, largest unknown, and the dominant unknown.
+                                    if (TraceNewton > 0)
+                                    {
+                                        LinqExpr tdvm = code.ReDeclInit<double>("tdvm", 0.0);
+                                        LinqExpr tvm = code.ReDeclInit<double>("tvm", 0.0);
+                                        LinqExpr targ = code.ReDeclInit<int>("targ", 0);
+                                        LinqExpr tdva = code.ReDeclInit<double>("tdva", 0.0);
+                                        LinqExpr tva = code.ReDeclInit<double>("tva", 0.0);
+                                        int tk = 0;
+                                        foreach (Expression ui in S.Unknowns)
+                                        {
+                                            LinqExpr tv0 = code[ui];
+                                            LinqExpr tdv0 = code[NewtonIteration.Delta(ui)];
+                                            code.Add(LinqExpr.IfThen(LinqExpr.GreaterThan(Abs(tdv0), tdvm), LinqExpr.Block(
+                                                LinqExpr.Assign(tdvm, Abs(tdv0)), LinqExpr.Assign(targ, LinqExpr.Constant(tk)),
+                                                LinqExpr.Assign(tdva, tdv0), LinqExpr.Assign(tva, tv0))));
+                                            code.Add(LinqExpr.IfThen(LinqExpr.GreaterThan(Abs(tv0), tvm), LinqExpr.Assign(tvm, Abs(tv0))));
+                                            tk++;
+                                        }
+                                        Stats.UnknownNames = S.Unknowns.Select(u => u.ToString()).ToArray();
+                                        Stats.TraceLimit = TraceNewton;
+                                        code.Add(LinqExpr.Call(statsConst, typeof(NewtonStats).GetMethod(nameof(NewtonStats.TraceIter)),
+                                            LinqExpr.Add(LinqExpr.Subtract(LinqExpr.Constant(Iterations), it), LinqExpr.Constant(1)),
+                                            tdvm, tvm, targ, tdva, tva));
+                                    }
 
                                     // bool done = true
                                     LinqExpr done = code.ReDeclInit("done", true);
@@ -347,6 +496,17 @@ namespace Circuit
                                     // --it;
                                     code.Add(LinqExpr.PreDecrementAssign(it));
                                 }, LinqExpr.GreaterThan(it, Zero));
+
+                                // Newton diagnostics: count this solve. it == 0 only if the cap ran out without converging.
+                                LinqExpr nwPos = LinqExpr.Add(nwBase, LinqExpr.Convert(n, typeof(long)));
+                                code.Add(LinqExpr.PreIncrementAssign(nwSolves));
+                                code.Add(LinqExpr.IfThen(LinqExpr.Equal(it, Zero), LinqExpr.Block(
+                                    LinqExpr.PreIncrementAssign(nwExh),
+                                    LinqExpr.IfThen(LinqExpr.LessThan(nwFirst, LinqExpr.Constant(0L)), LinqExpr.Assign(nwFirst, nwPos)),
+                                    LinqExpr.Assign(nwLast, nwPos))));
+                                if (TraceNewton > 0)
+                                    code.Add(LinqExpr.Call(statsConst, typeof(NewtonStats).GetMethod(nameof(NewtonStats.EndSolve)), nwPos,
+                                        LinqExpr.Condition(LinqExpr.Equal(it, Zero), LinqExpr.Constant(1), LinqExpr.Constant(0))));
 
                                 //// bool failed = false
                                 //LinqExpr failed = Decl(code, code, "failed", LinqExpr.Constant(false));
@@ -397,13 +557,26 @@ namespace Circuit
                     foreach (KeyValuePair<Expression, LinqExpr> i in outputs)
                         code.Add(LinqExpr.Assign(LinqExpr.ArrayAccess(i.Value, n), LinqExpr.Multiply(Vo[i.Key], invOversample)));
 
+                    // Newton diagnostics: track the largest output magnitude.
+                    foreach (KeyValuePair<Expression, LinqExpr> i in Vo)
+                    {
+                        LinqExpr mag = LinqExpr.Multiply(Abs(i.Value), invOversample);
+                        code.Add(LinqExpr.IfThen(LinqExpr.GreaterThan(mag, nwMax), LinqExpr.Assign(nwMax, mag)));
+                    }
+
                     // Every 256 samples, check for divergence.
                     if (Vo.Any())
                         code.Add(LinqExpr.IfThen(LinqExpr.Equal(LinqExpr.And(n, LinqExpr.Constant(0xFF)), Zero),
-                            LinqExpr.Block(Vo.Select(i => LinqExpr.IfThenElse(IsNotReal(i.Value),
-                                ThrowSimulationDiverged(n),
+                            LinqExpr.Block(Vo.Select(i => LinqExpr.IfThenElse(
+                                MagnitudeLimit > 0
+                                    ? LinqExpr.OrElse(IsNotReal(i.Value), LinqExpr.GreaterThan(Abs(i.Value), LinqExpr.Constant(MagnitudeLimit * Oversample)))
+                                    : IsNotReal(i.Value),
+                                LinqExpr.Block(flushStats(), ThrowSimulationDiverged(n)),
                                 LinqExpr.Assign(i.Value, RoundDenormToZero(i.Value)))))));
                 });
+
+            // Newton diagnostics: flush the counters for this chunk.
+            code.Add(flushStats());
 
             // Copy the global state variables back to the globals.
             foreach (KeyValuePair<Expression, GlobalExpr<double>> i in globals)
