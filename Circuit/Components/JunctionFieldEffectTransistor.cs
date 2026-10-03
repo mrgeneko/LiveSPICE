@@ -86,7 +86,7 @@ namespace Circuit
             Expression id = Call.Sign(Vds) * (Vgds >= Vt0) * Beta * (1 + Lambda * AbsVds) *
                 Call.If(AbsVds < Vgds_t0,
                     // Linear region.
-                    AbsVds * (2 * Vgds_t0 - 1),
+                    AbsVds * (2 * Vgds_t0 - AbsVds),
                     // Saturation region.
                     Vgds_t0 ^ 2);
 
